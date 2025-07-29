@@ -1,0 +1,299 @@
+How about this code? What is it for? Is it in working order? // SPDX-License-Identifier: MIT
+pragma solidity ^0.8.27;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+contract Ownable {
+    address public owner;
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Caller is not the owner");
+        _;
+    }
+
+    function transferOwnership(address newOwner) public onlyOwner {
+        require(newOwner != address(0), "New owner is the zero address");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+}
+
+interface IERC20 {
+    function transferFrom(address sender, address recipient, uint amount) external returns (bool);
+    function approve(address spender, uint amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint);
+    function transfer(address recipient, uint amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint);
+}
+
+interface IUniswapRouter {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    
+    function swapExactETHForTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable returns (uint[] memory amounts);
+
+    function swapExactTokensForETH(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+
+    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+}
+
+interface IWETH {
+    function deposit() external payable;
+    function withdraw(uint) external;
+}
+
+interface ISlippageManager {
+    function calculateAdaptiveSlippage(uint amountIn) external view returns (uint);
+}
+
+contract mtsb is Ownable, ReentrancyGuard {
+    address public uniswapRouter;
+    address public sushiSwapRouter;
+    IWETH public wethAddress;
+    ISlippageManager public slippageManager;
+
+    uint public profitabilityThreshold = 170; // 0.17% profit threshold
+    uint public stopLossPercentage = 3; // Stop-loss set to 3%
+    uint public accumulatedProfit;
+    uint public maxAccumulatedProfit;
+    uint public profitLockThreshold = 10; // Lock in 20% of maximum profit
+    uint public slippageTolerance = 250; // Slippage set to 0.25%
+    uint public tradeAmount;
+
+    event TradeSuccessful(address indexed tokenIn, address indexed tokenOut, uint amountIn, uint amountOut);
+    event TradeFailed(string reason, address indexed tokenIn, address indexed tokenOut, uint amountIn);
+    event EtherReceived(address indexed sender, uint value);
+    event Withdrawal(address indexed token, uint amount);
+    event SlippageCalculated(uint slippage);
+    event ProfitLocked(address indexed tokenIn, address indexed tokenOut, uint profitAmount);
+    event ArbitrageOpportunitySuccess(address indexed router, uint amountIn, uint amountOut);
+    event ArbitrageOpportunityFailed(address indexed router, uint amountIn, string reason);
+    event TriggeredByExternalContract(address indexed caller);
+    event TradeAmountUpdated(uint newTradeAmount);
+    event RouterUpdated(address indexed router, string routerType);
+    event ParametersUpdated(uint profitabilityThreshold, uint stopLossPercentage, uint profitLockThreshold, uint slippageTolerance);
+
+    constructor(address _wethAddress, address _slippageManager) {
+        wethAddress = IWETH(_wethAddress);
+        slippageManager = ISlippageManager(_slippageManager);
+    }
+
+    struct TradeData {
+        uint amountIn;
+        uint amountOutMin;
+        address[] path;
+        address router;
+        uint deadline;
+    }
+
+    // External functions to adjust parameters
+    function setProfitabilityThreshold(uint _profitabilityThreshold) external onlyOwner {
+        profitabilityThreshold = _profitabilityThreshold;
+        emit ParametersUpdated(profitabilityThreshold, stopLossPercentage, profitLockThreshold, slippageTolerance);
+    }
+
+    function setStopLossPercentage(uint _stopLossPercentage) external onlyOwner {
+        stopLossPercentage = _stopLossPercentage;
+        emit ParametersUpdated(profitabilityThreshold, stopLossPercentage, profitLockThreshold, slippageTolerance);
+    }
+
+    function setProfitLockThreshold(uint _profitLockThreshold) external onlyOwner {
+        profitLockThreshold = _profitLockThreshold;
+        emit ParametersUpdated(profitabilityThreshold, stopLossPercentage, profitLockThreshold, slippageTolerance);
+    }
+
+    function setSlippageTolerance(uint _slippageTolerance) external onlyOwner {
+        slippageTolerance = _slippageTolerance;
+        emit ParametersUpdated(profitabilityThreshold, stopLossPercentage, profitLockThreshold, slippageTolerance);
+    }
+
+    function setTradeAmount(uint _tradeAmount) external onlyOwner {
+        tradeAmount = _tradeAmount;
+        emit TradeAmountUpdated(_tradeAmount);
+    }
+
+    function setUniswapRouter(address _uniswapRouter) external onlyOwner {
+        require(_uniswapRouter != address(0), "Invalid address for Uniswap router");
+        uniswapRouter = _uniswapRouter;
+        emit RouterUpdated(_uniswapRouter, "Uniswap");
+    }
+
+    function setSushiSwapRouter(address _sushiSwapRouter) external onlyOwner {
+        require(_sushiSwapRouter != address(0), "Invalid address for Sushiswap router");
+        sushiSwapRouter = _sushiSwapRouter;
+        emit RouterUpdated(_sushiSwapRouter, "Sushiswap");
+    }
+
+    function executeTrade(
+        address[] calldata path,
+        uint amountOutMin,
+        address router,
+        uint deadline
+    ) external payable onlyOwner nonReentrant {
+        require(uniswapRouter != address(0) && sushiSwapRouter != address(0), "Routers not initialized");
+        require(router == uniswapRouter || router == sushiSwapRouter, "Invalid router");
+
+        TradeData memory tradeData = TradeData({
+            amountIn: msg.value > 0 ? msg.value : tradeAmount,
+            amountOutMin: amountOutMin,
+            path: path,
+            router: router,
+            deadline: deadline
+        });
+
+        emit TriggeredByExternalContract(msg.sender);
+
+        if (tradeData.amountIn == 0) {
+            emit TradeFailed("AmountIn is zero", tradeData.path[0], tradeData.path[tradeData.path.length - 1], tradeData.amountIn);
+            revert("Amount must be greater than zero");
+        }
+
+        require(accumulatedProfit >= profitLockThreshold, "Profit below lock threshold, cannot trade");
+
+        (bool isProfitable, uint expectedAmountOut) = _checkProfitability(tradeData.amountIn, tradeData.path, tradeData.router);
+        if (!isProfitable) {
+            emit TradeFailed("Trade not profitable", tradeData.path[0], tradeData.path[tradeData.path.length - 1], tradeData.amountIn);
+            revert("Trade not profitable");
+        }
+
+        uint adjustedAmountOutMin = (expectedAmountOut * (100 - slippageTolerance)) / 100;
+        if (adjustedAmountOutMin < tradeData.amountOutMin) {
+            emit TradeFailed("Slippage too high", tradeData.path[0], tradeData.path[tradeData.path.length - 1], tradeData.amountIn);
+            revert("Slippage too high");
+        }
+
+        if (msg.value > 0) { 
+            _executeETHtoTokenTrade(tradeData, adjustedAmountOutMin);
+        } else { 
+            _executeTokenToTokenTrade(tradeData, adjustedAmountOutMin);
+        }
+    }
+
+    function _checkProfitability(uint amountIn, address[] memory path, address router) internal returns (bool, uint) {
+        uint[] memory amountsOut = IUniswapRouter(router).getAmountsOut(amountIn, path);
+        if (amountsOut.length == 0) {
+            emit TradeFailed("Unable to get amounts out", path[0], path[path.length - 1], amountIn);
+            return (false, 0);
+        }
+        uint expectedAmountOut = amountsOut[1];
+        uint minimumProfit = (amountIn * (100 + profitabilityThreshold)) / 100;
+        uint amountOutThreshold = (amountIn * (100 - stopLossPercentage)) / 100;
+
+        bool isProfitable = expectedAmountOut >= minimumProfit && expectedAmountOut >= amountOutThreshold;
+        return (isProfitable, expectedAmountOut);
+    }
+
+    function _executeETHtoTokenTrade(TradeData memory tradeData, uint adjustedAmountOutMin) internal {
+        uint[] memory amounts;
+        try IUniswapRouter(tradeData.router).swapExactETHForTokens{
+            value: tradeData.amountIn
+        }(adjustedAmountOutMin, tradeData.path, address(this), tradeData.deadline) returns (uint[] memory _amounts) {
+            amounts = _amounts;
+            lockInProfit(amounts[amounts.length - 1] - tradeData.amountIn);
+            emit TradeSuccessful(tradeData.path[0], tradeData.path[tradeData.path.length - 1], tradeData.amountIn, amounts[amounts.length - 1]);
+        } catch Error(string memory reason) {
+            emit TradeFailed(reason, tradeData.path[0], tradeData.path[tradeData.path.length - 1], tradeData.amountIn);
+        } catch {
+            emit TradeFailed("Unknown error", tradeData.path[0], tradeData.path[tradeData.path.length - 1], tradeData.amountIn);
+        }
+    }
+
+    function _executeTokenToTokenTrade(TradeData memory tradeData, uint adjustedAmountOutMin) internal {
+        ensureApproval(tradeData.path[0], tradeData.router, tradeData.amountIn);
+
+        uint[] memory amounts;
+        try IUniswapRouter(tradeData.router).swapExactTokensForTokens(
+            tradeData.amountIn,
+            adjustedAmountOutMin,
+            tradeData.path,
+            address(this),
+            tradeData.deadline
+        ) returns (uint[] memory _amounts) {
+            amounts = _amounts;
+            lockInProfit(amounts[amounts.length - 1] - tradeData.amountIn);
+            emit TradeSuccessful(tradeData.path[0], tradeData.path[tradeData.path.length - 1], tradeData.amountIn, amounts[amounts.length - 1]);
+        } catch Error(string memory reason) {
+            emit TradeFailed(reason, tradeData.path[0], tradeData.path[tradeData.path.length - 1], tradeData.amountIn);
+        } catch {
+            emit TradeFailed("Unknown error", tradeData.path[0], tradeData.path[tradeData.path.length - 1], tradeData.amountIn);
+        }
+    }
+
+    function lockInProfit(uint profit) internal {
+        if (profit > maxAccumulatedProfit) {
+            maxAccumulatedProfit = profit;
+            profitLockThreshold = (maxAccumulatedProfit * 20) / 100;
+        }
+        accumulatedProfit += profit;
+        emit ProfitLocked(msg.sender, msg.sender, profit);
+    }
+
+    function wrapETH(uint amount) internal {
+        require(amount <= address(this).balance, "Insufficient Ether balance to wrap");
+        wethAddress.deposit{value: amount}();
+    }
+
+    function unwrapETH(uint amount) internal {
+        uint wethBalance = IERC20(address(wethAddress)).balanceOf(address(this));
+        require(amount <= wethBalance, "Amount exceeds WETH balance");
+        wethAddress.withdraw(amount);
+    }
+
+    function ensureApproval(address token, address router, uint amount) internal {
+        uint allowance = IERC20(token).allowance(address(this), router);
+        if (allowance < amount) {
+            require(IERC20(token).approve(router, type(uint256).max), "Approval failed");
+        }
+    }
+
+    receive() external payable {
+        emit EtherReceived(msg.sender, msg.value);
+    }
+
+    function withdrawEther() external onlyOwner {
+        uint balance = address(this).balance;
+        require(balance > 0, "No Ether to withdraw");
+        payable(owner).transfer(balance);
+        emit Withdrawal(address(0), balance);
+    }
+
+    function emergencyWithdraw(address tokenAddress) external onlyOwner {
+        uint tokenBalance = IERC20(tokenAddress).balanceOf(address(this));
+        if (tokenBalance > 0) {
+            IERC20(tokenAddress).transfer(owner, tokenBalance);
+            emit Withdrawal(tokenAddress, tokenBalance);
+        }
+
+        uint etherBalance = address(this).balance;
+        if (etherBalance > 0) {
+            payable(owner).transfer(etherBalance);
+            emit Withdrawal(address(0), etherBalance);
+        }
+    }
+
+    function updateTradeAmount(uint newTradeAmount) external onlyOwner {
+        tradeAmount = newTradeAmount;
+        emit TradeAmountUpdated(newTradeAmount);
+    }
+}
